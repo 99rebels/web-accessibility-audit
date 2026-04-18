@@ -2,10 +2,11 @@
 """
 a11y-audit.py — Automated WCAG 2.1 AA accessibility audit for websites.
 
-Pure Python stdlib. No dependencies.
+Default mode: Pure Python stdlib, no dependencies.
+JS rendering mode: Requires Playwright (pip install playwright && playwright install chromium).
 
 Usage:
-    python3 a11y-audit.py <url> [--max-pages N] [--timeout SECONDS] [--max-bytes BYTES] [--no-ssl-verify]
+    python3 a11y-audit.py <url> [--max-pages N] [--timeout SECONDS] [--max-bytes BYTES] [--no-ssl-verify] [--render]
 
 Output: JSON to stdout
 """
@@ -292,6 +293,7 @@ class A11YParser(HTMLParser):
         self._style_content = ""
         self._in_title = False
         self._title_text = ""
+        self._current_heading_idx = -1
 
     def handle_starttag(self, tag, attrs):
         t = tag.lower()
@@ -311,6 +313,10 @@ class A11YParser(HTMLParser):
         elif t == "a":
             href = ad.get("href", "")
             self.links.append((href, "", ad))
+        elif t in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            level = int(t[1])
+            self._current_heading_idx = len(self.headings)
+            self.headings.append((level, "", ad))
         elif t == "img":
             alt = ad.get("alt", None)
             src = ad.get("src", "")
@@ -383,10 +389,17 @@ class A11YParser(HTMLParser):
         elif t == "style":
             self._in_style = False
             self.style_blocks.append(self._style_content)
+        elif t in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            self._current_heading_idx = -1
 
     def handle_data(self, data):
         if self._in_title:
             self._title_text += data
+        # Capture heading text
+        if 0 <= self._current_heading_idx < len(self.headings):
+            level, text, attrs = self.headings[self._current_heading_idx]
+            self.headings[self._current_heading_idx] = (level, text + data, attrs)
+        # Capture link text
         if self.links and not self.links[-1][1]:
             self.links[-1] = (self.links[-1][0], data, self.links[-1][2])
 
@@ -399,6 +412,86 @@ class A11YParser(HTMLParser):
         for eid, count in self._id_counts.items():
             if count > 1:
                 self.duplicate_ids.append((eid, count))
+
+
+# ─── JS-Heavy Detection ───────────────────────────────────────────────────
+
+# Patterns that indicate a JS-rendered page
+JS_FRAMEWORK_PATTERNS = re.compile(
+    r'(?:react|next|nuxt|vue|angular|svelte|gatsby|remix|webpack|vite|__NEXT_DATA__|__NUXT__|ng-app|ng-version)',
+    re.I
+)
+JS_HEAVY_INDICATORS = re.compile(
+    r'(?:<noscript|data-reactroot|data-reactid|id="__next"|id="app"|id="root"|class="app"|ng-app)',
+    re.I
+)
+TRACKING_PIXEL_PATTERNS = re.compile(
+    r'(?:pixel|beacon|tracking|analytics|ping|log\?|collect\?|hit\?|impression)',
+    re.I
+)
+
+
+def _is_tracking_pixel(src, attrs):
+    """Detect if an image is likely a tracking pixel."""
+    if not src:
+        return False
+    # Check URL patterns
+    if TRACKING_PIXEL_PATTERNS.search(src):
+        return True
+    # Check for common 1x1 pixel indicators in URL
+    if re.search(r'(?:1x1|1\s*[x×]\s*1|spacer|blank|gif;base64)', src, re.I):
+        return True
+    # Check width/height attributes for 1x1
+    w = attrs.get("width", "")
+    h = attrs.get("height", "")
+    try:
+        if w and h and int(w) <= 2 and int(h) <= 2:
+            return True
+    except (ValueError, TypeError):
+        pass
+    return False
+
+
+def _detect_js_heavy(html_text, parser):
+    """Detect if a page is likely JavaScript-heavy / client-side rendered.
+    
+    Heuristics:
+    - Framework scripts or markers in HTML
+    - Few structural elements relative to page size
+    - <noscript> tags present
+    - Body content is mostly script tags
+    
+    Returns True if likely JS-heavy.
+    """
+    if not html_text:
+        return False
+    
+    text_len = len(html_text)
+    
+    # Framework markers in HTML
+    if JS_FRAMEWORK_PATTERNS.search(html_text):
+        return True
+    
+    # Common JS-heavy structural indicators
+    if JS_HEAVY_INDICATORS.search(html_text):
+        return True
+    
+    # Check ratio of script content to total content
+    script_blocks = re.findall(r'<script[^>]*>.*?</script>', html_text, re.DOTALL | re.I)
+    script_len = sum(len(s) for s in script_blocks)
+    if text_len > 10000 and script_len > text_len * 0.5:
+        return True
+    
+    # Few structural elements relative to page size (large page, few links/headings)
+    structural_count = len(parser.links) + len(parser.headings) + len(parser.images) + len(parser.inputs)
+    if text_len > 20000 and structural_count < 30:
+        return True
+    
+    # <noscript> tags present (indicates JS dependency)
+    if re.search(r'<noscript', html_text, re.I):
+        return True
+    
+    return False
 
 
 # ─── Check Runner ────────────────────────────────────────────────────────────
@@ -438,6 +531,15 @@ def run_checks(html_text, url="", css_text=""):
             aria_hidden = attrs.get("aria-hidden", "")
             if role == "presentation" or role == "none" or aria_hidden == "true":
                 continue  # Decorative, no alt needed
+            # Check if it's a tracking pixel (decorative by nature)
+            if _is_tracking_pixel(src, attrs):
+                checks.append(WCAGCheck(
+                    "1.1.1", "A", "Image missing alt text (tracking pixel)",
+                    "low", f'<img src="{src[:80]}">', 
+                    "Tracking pixel has no alt attribute. While tracking pixels are decorative and should use alt=\"\" or role=\"presentation\", the missing alt is technically a WCAG failure.",
+                    'Add alt="" and role="presentation": <img src="..." alt="" role="presentation">'
+                ))
+                continue
             checks.append(WCAGCheck(
                 "1.1.1", "A", "Image missing alt text",
                 "critical", f'<img src="{src[:60]}">', 
@@ -510,6 +612,9 @@ def run_checks(html_text, url="", css_text=""):
                 f'Add a label: <label for="{eid}">Label text</label> or aria-label="Purpose"'
             ))
         elif not has_label and has_aria:
+            # Search inputs with aria-label are widely accepted — skip
+            if itype == "search":
+                continue
             checks.append(WCAGCheck(
                 "3.3.2", "A", "Form input using aria-label instead of visible label",
                 "low", f'<{tag} type="{itype}" name="{name}">',
@@ -617,18 +722,27 @@ def run_checks(html_text, url="", css_text=""):
     # ── 2.4.6 Headings and Labels (AA) ──
     # Check for pages with substantial content but no headings
     text_len = len(html_text)
+    js_heavy = _detect_js_heavy(html_text, parser)
     if text_len > 5000 and not parser.headings:
-        checks.append(WCAGCheck(
-            "2.4.6", "AA", "No headings found on content page",
-            "high", "<h1>", "Page has substantial content but no heading elements. Headings help screen reader users navigate and understand page structure.",
-            "Add headings to organize content: <h1>Main topic</h1>, <h2>Section</h2>, etc."
-        ))
+        if js_heavy:
+            # Likely JS-rendered — downgrade to medium with caveat
+            checks.append(WCAGCheck(
+                "2.4.6", "AA", "No headings found on content page (likely JS-rendered)",
+                "medium", "<h1>", "Page has substantial content but no heading elements in the initial HTML. This page appears to be JavaScript-heavy — headings may be rendered client-side. Verify with a manual audit.",
+                "Ensure headings exist in the server-rendered HTML or use progressive enhancement."
+            ))
+        else:
+            checks.append(WCAGCheck(
+                "2.4.6", "AA", "No headings found on content page",
+                "high", "<h1>", "Page has substantial content but no heading elements. Headings help screen reader users navigate and understand page structure.",
+                "Add headings to organize content: <h1>Main topic</h1>, <h2>Section</h2>, etc."
+            ))
 
     # Set page URL on all checks
     for check in checks:
         check.page_url = url
 
-    return checks, parser
+    return checks, parser, js_heavy
 
 
 # ─── Scoring ─────────────────────────────────────────────────────────────────
@@ -664,6 +778,71 @@ def get_grade(score):
     if score >= 70: return "C"
     if score >= 60: return "D"
     return "F"
+
+
+# ─── Playwright (JS Rendering) ────────────────────────────────────────────────
+
+def check_playwright_available():
+    """Check if Playwright is installed. Returns (available: bool, message: str)."""
+    try:
+        import playwright  # noqa: F401
+        return True, "Playwright is installed."
+    except ImportError:
+        return False, (
+            "Playwright is not installed. JS rendering (--render) requires Playwright. "
+            "Install with: pip install playwright && playwright install chromium"
+        )
+
+
+def render_page(url, timeout=30, max_bytes=1048576, verify_ssl=True):
+    """Fetch a page using Playwright for full JS rendering.
+    
+    Returns (status, html, error) — same interface as fetch().
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return 0, "", "Playwright not installed. Run: pip install playwright && playwright install chromium"
+    
+    try:
+        with sync_playwright() as p:
+            # Try system Chrome first (no download needed), fall back to Chromium
+            try:
+                browser = p.chromium.launch(
+                    channel="chrome",
+                    headless=True,
+                    args=["--disable-gpu", "--no-sandbox", "--ignore-certificate-errors"] if not verify_ssl else ["--disable-gpu", "--no-sandbox"]
+                )
+            except Exception:
+                browser = p.chromium.launch(headless=True, args=["--disable-gpu", "--no-sandbox"])
+
+            
+            page = browser.new_page(
+                user_agent=USER_AGENT,
+                viewport={"width": 1280, "height": 720},
+            )
+            
+            try:
+                page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
+            except Exception:
+                # networkidle can timeout on chatty pages — use domcontentloaded + wait
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+                    # Wait for JS to render content
+                    page.wait_for_timeout(5000)
+                except Exception as e:
+                    browser.close()
+                    return 0, "", f"Page load failed: {e}"
+            
+            html = page.content()
+            browser.close()
+            
+            if len(html) > max_bytes:
+                html = html[:max_bytes]
+            
+            return 200, html, None
+    except Exception as e:
+        return 0, "", str(e)
 
 
 # ─── HTTP Fetch ──────────────────────────────────────────────────────────────
@@ -745,8 +924,20 @@ def parse_sitemap(text):
 
 # ─── Main ────────────────────────────────────────────────────────────────────
 
-def audit(url, max_pages=10, timeout=15, max_bytes=524288, verify_ssl=True, page_type_mode=False):
+def audit(url, max_pages=10, timeout=15, max_bytes=524288, verify_ssl=True, page_type_mode=False, render=False):
     """Run full accessibility audit."""
+    
+    # Determine fetch method
+    use_render = render
+    render_warning = None
+    if render:
+        available, msg = check_playwright_available()
+        if not available:
+            use_render = False
+            render_warning = msg
+            print(json.dumps({"warning": msg, "fallback": "plain_http"}), file=sys.stderr)
+    
+    _fetch = render_page if use_render else fetch
     from urllib.parse import urlparse
     parsed = urlparse(url)
     base = f"{parsed.scheme}://{parsed.netloc}"
@@ -763,9 +954,20 @@ def audit(url, max_pages=10, timeout=15, max_bytes=524288, verify_ssl=True, page
     }
 
     all_checks = []
+    
+    # Build result structure with render info
+    if use_render:
+        result["render_mode"] = "playwright"
+    elif render and render_warning:
+        result["render_mode"] = "plain_http"
+        result["render_warning"] = render_warning
+    else:
+        result["render_mode"] = "plain_http"
 
     # 1. Homepage
-    st, html, err = fetch(url, timeout, max_bytes, verify_ssl)
+    _fetch_timeout = timeout * 2 if use_render else timeout
+    _fetch_max = max_bytes * 2 if use_render else max_bytes
+    st, html, err = _fetch(url, _fetch_timeout, _fetch_max, verify_ssl if not use_render else True)
     if err and st == 0:
         result["homepage"] = {"url": url, "status": 0, "error": err}
         result["errors"] = [err]
@@ -774,7 +976,7 @@ def audit(url, max_pages=10, timeout=15, max_bytes=524288, verify_ssl=True, page
         result["homepage"] = {"url": url, "status": st, "error": "Not HTML or non-200"}
         return result
 
-    checks, parser = run_checks(html, url)
+    checks, parser, js_heavy = run_checks(html, url)
     result["homepage"] = {
         "url": url,
         "status": st,
@@ -790,10 +992,11 @@ def audit(url, max_pages=10, timeout=15, max_bytes=524288, verify_ssl=True, page
         "aria_element_count": len(parser.aria_elements),
         "style_block_count": len(parser.style_blocks),
         "page_type": "homepage",
+        "js_heavy": js_heavy,
     }
     all_checks.extend(checks)
 
-    # 2. Sitemap
+    # 2. Sitemap (always use plain HTTP — sitemaps don't need JS rendering)
     sm_url = f"{base}/sitemap.xml"
     st, sm_html, _ = fetch(sm_url, timeout, max_bytes, verify_ssl)
     sitemap_pages = []
@@ -819,14 +1022,14 @@ def audit(url, max_pages=10, timeout=15, max_bytes=524288, verify_ssl=True, page
     # 3. Additional pages
     for page_info in crawl_urls:
         pu = page_info["url"]
-        st, html, err = fetch(pu, timeout, max_bytes, verify_ssl)
+        st, html, err = _fetch(pu, _fetch_timeout, _fetch_max, verify_ssl if not use_render else True)
         if err and st == 0:
             result["additional_pages"].append({"url": pu, "status": 0, "error": err})
             continue
         if st != 200 or not html:
             result["additional_pages"].append({"url": pu, "status": st, "is_html": False})
             continue
-        checks, parser = run_checks(html, pu)
+        checks, parser, js_heavy = run_checks(html, pu)
         pr = {
             "url": pu, "status": st,
             "title": parser.title, "lang": parser.lang,
@@ -836,6 +1039,7 @@ def audit(url, max_pages=10, timeout=15, max_bytes=524288, verify_ssl=True, page
             "input_count": len(parser.inputs),
             "link_count": len(parser.links),
             "page_type": classify_page_type(pu),
+            "js_heavy": js_heavy,
         }
         result["additional_pages"].append(pr)
         all_checks.extend(checks)
@@ -853,6 +1057,7 @@ def audit(url, max_pages=10, timeout=15, max_bytes=524288, verify_ssl=True, page
         "by_severity": dict(severity_counts),
         "by_criterion": {k: v for k, v in sorted(criterion_counts.items())},
         "criteria_checked": list(set(c.criterion for c in all_checks)),
+        "js_heavy": result["homepage"].get("js_heavy", False),
     }
 
     # 5. Score
@@ -876,6 +1081,7 @@ def main():
     ap.add_argument("--timeout", type=int, default=15, help="Request timeout (default: 15)")
     ap.add_argument("--max-bytes", type=int, default=524288, help="Max response size (default: 512KB)")
     ap.add_argument("--no-ssl-verify", action="store_true", help="Skip SSL verification")
+    ap.add_argument("--render", action="store_true", help="Enable JS rendering via Playwright (recommended for thorough audits)")
     args = ap.parse_args()
 
     def validate_url(u):
@@ -900,6 +1106,7 @@ def main():
         max_bytes=args.max_bytes,
         verify_ssl=not args.no_ssl_verify,
         page_type_mode=args.page_types,
+        render=args.render,
     )
     print(json.dumps(result, indent=2, default=str))
 
