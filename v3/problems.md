@@ -1,4 +1,4 @@
-# a11y-audit v3 — Changelog & Status
+# web-accessibility-audit v3 — Changelog & Status
 
 ## v3.0.0 — 2026-04-19
 

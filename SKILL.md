@@ -1,5 +1,5 @@
 ---
-name: a11y-audit
+name: web-accessibility-audit
 description: >-
   WCAG 2.1 AA accessibility audit that produces a client-ready report. Crawls
   websites, checks 20+ accessibility criteria, maps findings to specific WCAG
@@ -21,7 +21,7 @@ allowed-tools:
 ## When to Use
 
 - "Audit my site for accessibility"
-- "WCAG audit", "accessibility check", "a11y audit"
+- "WCAG audit", "accessibility check", "accessibility audit"
 - "Is my website ADA compliant?"
 - "Check my site for accessibility issues"
 - "Generate an accessibility report for my client"
@@ -30,10 +30,10 @@ allowed-tools:
 
 ```bash
 # Full audit with JS rendering (recommended for all sites)
-python3 scripts/a11y-audit.py "https://example.com" --render
+python3 scripts/web-accessibility-audit.py "https://example.com" --render
 
 # Basic mode (no JS rendering — misses issues on modern sites)
-python3 scripts/a11y-audit.py "https://example.com"
+python3 scripts/web-accessibility-audit.py "https://example.com"
 ```
 
 ### Installing Playwright (required for full audits)
@@ -61,16 +61,16 @@ This downloads the Chromium browser (~130MB, one-time). If Chrome is already ins
 
 ```
 # Page-type sampling (one of each: homepage, product, content, category)
-python3 scripts/a11y-audit.py "https://example.com" --page-types --render
+python3 scripts/web-accessibility-audit.py "https://example.com" --page-types --render
 
 # Homepage only (fastest, no JS rendering)
-python3 scripts/a11y-audit.py "https://example.com" --max-pages 1
+python3 scripts/web-accessibility-audit.py "https://example.com" --max-pages 1
 
 # Homepage with JS rendering
-python3 scripts/a11y-audit.py "https://example.com" --max-pages 1 --render
+python3 scripts/web-accessibility-audit.py "https://example.com" --max-pages 1 --render
 
 # Deep crawl with JS rendering
-python3 scripts/a11y-audit.py "https://example.com" --max-pages 50 --render
+python3 scripts/web-accessibility-audit.py "https://example.com" --max-pages 50 --render
 ```
 
 **Flags:**
