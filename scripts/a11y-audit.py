@@ -646,16 +646,58 @@ def run_checks(html_text, url="", css_text=""):
         ))
 
     # ── 2.4.4 Link Purpose (A) ──
+
+    # Pre-check: find links containing SVGs with <title> or aria-label (accessible name via SVG)
+    svg_accessible_links = set()
+    for m in re.finditer(r'<a\s+[^>]*href=["\']([^"\' >]+)["\'][^>]*>\s*<svg[^>]*>.*?</svg>\s*</a>', html_text, re.DOTALL | re.I):
+        href = m.group(1).strip()
+        svg_content = m.group(0)
+        if re.search(r'<title[^>]*>[^<]+</title>', svg_content, re.I) or re.search(r'aria-label=["\']', svg_content, re.I):
+            svg_accessible_links.add(href)
+
+    # Pre-check: find links containing images with alt text (accessible name via img alt)
+    img_accessible_links = set()
+    for m in re.finditer(r'<a\s+[^>]*href=["\']([^"\' >]+)["\'][^>]*>\s*<img[^>]+alt=["\']([^"\'\']+)["\'][^>]*/?>', html_text, re.DOTALL | re.I):
+        href = m.group(1).strip()
+        alt = m.group(2).strip()
+        if alt:
+            img_accessible_links.add(href)
+
     for href, text, attrs in parser.links:
         if not text or not text.strip():
             if attrs.get("aria-label") or attrs.get("aria-labelledby"):
                 continue
-            checks.append(WCAGCheck(
-                "2.4.4", "A", "Empty link with no accessible name",
-                "high", f'<a href="{href[:60]}">',
-                "Link has no text content and no aria-label. Screen reader users cannot determine where this link goes.",
-                f'Add text or aria-label: <a href="{href[:40]}..." aria-label="Description">'
+            # Skip links where SVG <title> or img alt provides the accessible name
+            if href in svg_accessible_links or href in img_accessible_links:
+                continue
+            # Check if link contains an SVG (icon link) or img
+            is_svg_icon = bool(re.search(
+                r'<a\s+[^>]*href=["\']' + re.escape(href) + r'["\'][^>]*>.*?<svg',
+                html_text, re.DOTALL | re.I
             ))
+            is_img_link = bool(re.search(
+                r'<a\s+[^>]*href=["\']' + re.escape(href) + r'["\'][^>]*>.*?<img',
+                html_text, re.DOTALL | re.I
+            ))
+            if is_svg_icon:
+                # SVG icon without accessible name — medium severity
+                checks.append(WCAGCheck(
+                    "2.4.4", "A", "Icon link missing accessible name",
+                    "medium", f'<a href="{href[:60]}">',
+                    "Link contains an SVG icon but no aria-label or SVG <title>. Screen reader users cannot determine the link's purpose.",
+                    f'Add aria-label: <a href="{href[:40]}..." aria-label="Link description">'
+                ))
+            elif is_img_link:
+                # Image inside link — alt text issues caught by 1.1.1, skip here
+                continue
+            else:
+                # Truly empty link — no text, no SVG, no image
+                checks.append(WCAGCheck(
+                    "2.4.4", "A", "Empty link with no accessible name",
+                    "high", f'<a href="{href[:60]}">',
+                    "Link has no text content, no image, and no aria-label. Screen reader users cannot determine where this link goes.",
+                    f'Add text or aria-label: <a href="{href[:40]}..." aria-label="Description">'
+                ))
         else:
             stripped = text.strip().lower()
             for pattern in AMBIGUOUS_LINK_PATTERNS:
