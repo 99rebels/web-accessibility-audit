@@ -747,6 +747,78 @@ def run_checks(html_text, url="", css_text=""):
 
 # ─── Scoring ─────────────────────────────────────────────────────────────────
 
+def check_contrast_from_computed(contrast_data, url):
+    """Process Playwright computed style data into WCAG contrast findings.
+    
+    Takes the output from the Playwright contrast pass and uses the existing
+    luminance/contrast functions to check against WCAG thresholds.
+    """
+    checks = []
+    if not contrast_data or not isinstance(contrast_data, dict):
+        return checks
+    
+    elements = contrast_data.get("elements", [])
+    capped = contrast_data.get("capped", False)
+    total = contrast_data.get("total", 0)
+    skipped_pairs = contrast_data.get("skippedPairs", 0)
+    
+    for el in elements:
+        fg = el.get("fg")
+        bg = el.get("bg")
+        if not fg or not bg:
+            continue  # Can't determine background (e.g., image background, gradient)
+        
+        fg_rgb = (fg["r"], fg["g"], fg["b"])
+        bg_rgb = (bg["r"], bg["g"], bg["b"])
+        
+        ratio = contrast_ratio(fg_rgb, bg_rgb)
+        if ratio is None:
+            continue
+        
+        # Determine text size for threshold
+        font_size = el.get("fontSize", 16)
+        font_weight = str(el.get("fontWeight", "400"))
+        is_bold = font_weight.lower() in ("bold", "bolder") or (font_weight.isdigit() and int(font_weight) >= 700)
+        
+        if font_size >= LARGE_TEXT_PX or (font_size >= LARGE_TEXT_BOLD_PX and is_bold):
+            threshold = CONTRAST_AA_LARGE
+            level = "AA Large Text"
+        else:
+            threshold = CONTRAST_AA_NORMAL
+            level = "AA Normal Text"
+        
+        if ratio < threshold:
+            severity = "critical" if ratio < 3.0 else "high"
+            element_str = el.get("element", "")
+            text_preview = el.get("text", "")[:40]
+            
+            checks.append(WCAGCheck(
+                "1.4.3", "AA", f"Insufficient color contrast ({level})",
+                severity,
+                f'{element_str} "{text_preview}"',
+                f'Computed contrast ratio is {ratio:.2f}:1, minimum required is {threshold}:1 for {level.lower()}. Text preview: "{text_preview}"',
+                f"Adjust foreground or background color to achieve at least {threshold}:1 contrast ratio. Current: {ratio:.2f}:1."
+            ))
+    
+    # Note about cap
+    # Note about cap — only show if we actually hit the element limit
+    # (not if elements were skipped due to color pair dedup)
+    if capped and len(elements) >= 480:  # 480 ≈ 500 minus dedup overhead
+        checks.append(WCAGCheck(
+            "1.4.3", "AA", "Contrast check limited to 500 elements",
+            "low", "contrast-check",
+            f"Checked {len(elements)} of ~{total} visible text elements (after dedup). Some contrast issues may not have been caught. Use a browser extension (axe DevTools, WAVE) for complete coverage.",
+            "For full contrast coverage, run a browser extension like axe DevTools or WAVE on this page."
+        ))
+    
+    for check in checks:
+        check.page_url = url
+    
+    return checks
+
+
+# ─── Scoring ─────────────────────────────────────────────────────────────────
+
 def calculate_score(checks):
     """Calculate a 0-100 accessibility score.
     
@@ -797,12 +869,13 @@ def check_playwright_available():
 def render_page(url, timeout=30, max_bytes=1048576, verify_ssl=True):
     """Fetch a page using Playwright for full JS rendering.
     
-    Returns (status, html, error) — same interface as fetch().
+    Returns (status, html, error, contrast_data) — contrast_data is a list of dicts
+    with computed style info for visible text elements, or empty list if not available.
     """
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        return 0, "", "Playwright not installed. Run: pip install playwright && playwright install chromium"
+        return 0, "", "Playwright not installed. Run: pip install playwright && playwright install chromium", []
     
     try:
         with sync_playwright() as p:
@@ -825,29 +898,118 @@ def render_page(url, timeout=30, max_bytes=1048576, verify_ssl=True):
             try:
                 page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
             except Exception:
-                # networkidle can timeout on chatty pages — use domcontentloaded + wait
+                # networkidle can timeout on chatty pages — use domcontentloaded + smart wait
                 try:
                     page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
-                    # Wait for JS to render content
-                    page.wait_for_timeout(5000)
+                    # Wait for headings to appear (indicates JS has rendered content)
+                    try:
+                        page.wait_for_selector('h1, h2, h3', timeout=10000)
+                    except Exception:
+                        # No headings found — some pages genuinely don't have them, wait a bit anyway
+                        page.wait_for_timeout(3000)
                 except Exception as e:
                     browser.close()
-                    return 0, "", f"Page load failed: {e}"
+                    return 0, "", f"Page load failed: {e}", []
             
             html = page.content()
+
+            # Contrast check pass — get computed styles for visible text elements
+            contrast_data = []
+            try:
+                contrast_data = page.evaluate("""() => {
+                    const MAX_ELEMENTS = 500;
+                    const results = [];
+                    const seen = new Set();
+                    const seenColorPairs = new Set();
+
+                    // Walk up the DOM to find the effective (non-transparent) background
+                    function getEffectiveBg(el) {
+                        let current = el;
+                        let depth = 0;
+                        while (current && current !== document.body && depth < 5) {
+                            const bg = window.getComputedStyle(current).backgroundColor;
+                            const m = bg.match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+),?\\s*([\\d.]*)\\)/);
+                            if (m) {
+                                const a = m[4] !== '' ? parseFloat(m[4]) : 1;
+                                if (a > 0.05) return {r: parseInt(m[1]), g: parseInt(m[2]), b: parseInt(m[3])};
+                            }
+                            current = current.parentElement;
+                            depth++;
+                        }
+                        // Body fallback
+                        const bodyBg = window.getComputedStyle(document.body).backgroundColor;
+                        const bm = bodyBg.match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+),?\\s*([\\d.]*)\\)/);
+                        if (bm) return {r: parseInt(bm[1]), g: parseInt(bm[2]), b: parseInt(bm[3])};
+                        return null;
+                    }
+
+                    const tags = 'p, span, a, h1, h2, h3, h4, h5, h6, li, td, th, label, button, dt, dd, figcaption, blockquote, summary';
+                    const elements = document.querySelectorAll(tags);
+                    let totalChecked = 0;
+
+                    for (const el of elements) {
+                        totalChecked++;
+                        if (results.length >= MAX_ELEMENTS) break;
+
+                        const cs = window.getComputedStyle(el);
+                        if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity) === 0) continue;
+
+                        const text = (el.textContent || '').trim();
+                        if (!text || text.length < 2) continue;
+
+                        // Deduplicate by tag+class+first-chars
+                        const key = el.tagName + '|' + el.className + '|' + text.substring(0, 30);
+                        if (seen.has(key)) continue;
+                        seen.add(key);
+
+                        // Foreground color
+                        const fgMatch = cs.color.match(/rgb\\((\\d+),\\s*(\\d+),\\s*(\\d+)\\)/);
+                        if (!fgMatch) continue;
+
+                        // Background (walk up for transparent)
+                        const bg = getEffectiveBg(el);
+
+                        // Skip if we've already seen this exact fg/bg color pair
+                        const colorKey = fgMatch[1] + ',' + fgMatch[2] + ',' + fgMatch[3] + '|' + (bg ? bg.r + ',' + bg.g + ',' + bg.b : 'none');
+                        if (seenColorPairs.has(colorKey)) continue;
+
+                        results.push({
+                            tag: el.tagName.toLowerCase(),
+                            fg: {r: parseInt(fgMatch[1]), g: parseInt(fgMatch[2]), b: parseInt(fgMatch[3])},
+                            bg: bg,
+                            fontSize: parseFloat(cs.fontSize) || 16,
+                            fontWeight: cs.fontWeight,
+                            text: text.substring(0, 60),
+                            className: (el.className || '').substring(0, 80),
+                            element: '<' + el.tagName.toLowerCase() + (el.className ? ' class="' + el.className.substring(0, 40) + '"' : '') + '>',
+                        });
+
+                        // Only track the pair if this element actually failed contrast
+                        // (we don't know yet, but Python will filter — mark it to avoid re-checking same colors)
+                        seenColorPairs.add(colorKey);
+                    }
+
+                    return {elements: results, capped: totalChecked > MAX_ELEMENTS, total: totalChecked, skippedPairs: seenColorPairs.size};
+                }""")
+            except Exception:
+                pass  # Contrast pass failed silently — not critical
+
             browser.close()
             
             if len(html) > max_bytes:
                 html = html[:max_bytes]
             
-            return 200, html, None
+            return 200, html, None, contrast_data
     except Exception as e:
-        return 0, "", str(e)
+        return 0, "", str(e), []
 
 
 # ─── HTTP Fetch ──────────────────────────────────────────────────────────────
 
 def fetch(url, timeout=15, max_bytes=524288, verify_ssl=True):
+    """Fetch a URL via plain HTTP. Returns (status, html, error, contrast_data).
+    contrast_data is always an empty list for plain HTTP mode.
+    """
     try:
         ctx = None
         if not verify_ssl:
@@ -860,15 +1022,15 @@ def fetch(url, timeout=15, max_bytes=524288, verify_ssl=True):
         })
         with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
             body = resp.read(max_bytes)
-            return resp.status, body.decode("utf-8", errors="replace"), None
+            return resp.status, body.decode("utf-8", errors="replace"), None, []
     except urllib.error.HTTPError as e:
         try:
             body = e.read(max_bytes).decode("utf-8", errors="replace")
         except Exception:
             body = ""
-        return e.code, body, None
+        return e.code, body, None, []
     except Exception as e:
-        return 0, "", str(e)
+        return 0, "", str(e), []
 
 
 # ─── Page Type ───────────────────────────────────────────────────────────────
@@ -896,6 +1058,100 @@ def select_page_type_samples(sitemap_pages):
         pages.sort(key=lambda p: (p["priority"] is not None, p["priority"] or 0), reverse=True)
         samples.extend(pages[:1])
     return samples
+
+
+def extract_links_from_html(html_text, base_url):
+    """Extract same-domain links from HTML content.
+    
+    Used as fallback when sitemap yields insufficient pages.
+    Returns list of {"url": ..., "priority": None, "lastmod": None} dicts.
+    """
+    links = []
+    seen = set()
+    parsed_base = urllib.parse.urlparse(base_url)
+    base_domain = parsed_base.netloc
+
+    for m in re.finditer(r'<a\s+[^>]*href=["\']([^"\' >]+)["\'][^>]*>', html_text, re.I):
+        href = m.group(1).strip()
+        # Skip anchors, javascript, mailto
+        if href.startswith('#') or href.startswith('javascript:') or href.startswith('mailto:'):
+            continue
+        # Resolve relative URLs
+        full = urllib.parse.urljoin(base_url, href)
+        parsed = urllib.parse.urlparse(full)
+        # Same domain only, skip extensions, skip duplicates
+        if parsed.netloc != base_domain:
+            continue
+        if SKIP_EXTENSIONS.search(parsed.path):
+            continue
+        if full in seen:
+            continue
+        seen.add(full)
+        links.append({"url": full, "priority": None, "lastmod": None})
+
+    return links
+
+
+def build_page_discovery(sitemap_pages, homepage_links, crawl_urls, page_type_mode):
+    """Build a summary of discovered pages and what was audited.
+    
+    Returns a dict with:
+    - total_discovered: total unique pages found (from all sources)
+    - source: where pages came from ("sitemap", "homepage_links", "sitemap+homepage_links")
+    - by_type: breakdown of discovered pages by type
+    - audited: list of URLs that were actually audited
+    """
+    # Combine all discovered pages (deduplicated)
+    all_discovered = {}
+    for p in sitemap_pages:
+        all_discovered[p["url"]] = p
+    for p in homepage_links:
+        if p["url"] not in all_discovered:
+            all_discovered[p["url"]] = p
+
+    # Classify all discovered pages
+    by_type = defaultdict(int)
+    for url in all_discovered:
+        ptype = classify_page_type(url)
+        by_type[ptype] += 1
+
+    # Determine source
+    source = "sitemap"
+    if not sitemap_pages and homepage_links:
+        source = "homepage_links"
+    elif sitemap_pages and homepage_links:
+        source = "sitemap+homepage_links"
+
+    audited_urls = [u["url"] for u in crawl_urls]
+
+    return {
+        "total_discovered": len(all_discovered),
+        "source": source,
+        "by_type": dict(by_type),
+        "audited_count": len(audited_urls),
+        "audited_urls": audited_urls,
+    }
+
+
+def deduplicate_findings(findings):
+    """Deduplicate findings by (criterion, element, detail) tuple.
+    
+    Returns list of finding dicts with a "count" field added for duplicates.
+    Preserves original order, keeps first occurrence.
+    """
+    seen = {}
+    result = []
+    for f in findings:
+        # Dedup by criterion + title + detail (not element — different links have different elements)
+        key = (f["criterion"], f["title"], f["detail"])
+        if key in seen:
+            seen[key]["count"] += 1
+        else:
+            f_copy = dict(f)
+            f_copy["count"] = 1
+            seen[key] = f_copy
+            result.append(f_copy)
+    return result
 
 
 # ─── Sitemap ─────────────────────────────────────────────────────────────────
@@ -967,7 +1223,7 @@ def audit(url, max_pages=10, timeout=15, max_bytes=524288, verify_ssl=True, page
     # 1. Homepage
     _fetch_timeout = timeout * 2 if use_render else timeout
     _fetch_max = max_bytes * 2 if use_render else max_bytes
-    st, html, err = _fetch(url, _fetch_timeout, _fetch_max, verify_ssl if not use_render else True)
+    st, html, err, contrast_raw = _fetch(url, _fetch_timeout, _fetch_max, verify_ssl if not use_render else True)
     if err and st == 0:
         result["homepage"] = {"url": url, "status": 0, "error": err}
         result["errors"] = [err]
@@ -977,6 +1233,14 @@ def audit(url, max_pages=10, timeout=15, max_bytes=524288, verify_ssl=True, page
         return result
 
     checks, parser, js_heavy = run_checks(html, url)
+
+    # Contrast check from computed styles (Playwright only)
+    if use_render and contrast_raw:
+        contrast_checks = check_contrast_from_computed(contrast_raw, url)
+        checks.extend(contrast_checks)
+    
+    result["contrast_elements_checked"] = len(contrast_raw.get("elements", [])) if isinstance(contrast_raw, dict) else 0
+    result["contrast_capped"] = len(contrast_raw.get("elements", [])) >= 480 and contrast_raw.get("capped", False) if isinstance(contrast_raw, dict) else False
     result["homepage"] = {
         "url": url,
         "status": st,
@@ -998,19 +1262,28 @@ def audit(url, max_pages=10, timeout=15, max_bytes=524288, verify_ssl=True, page
 
     # 2. Sitemap (always use plain HTTP — sitemaps don't need JS rendering)
     sm_url = f"{base}/sitemap.xml"
-    st, sm_html, _ = fetch(sm_url, timeout, max_bytes, verify_ssl)
+    st, sm_html, _, _ = fetch(sm_url, timeout, max_bytes, verify_ssl)
     sitemap_pages = []
     if st == 200 and sm_html:
         sitemap_pages = parse_sitemap(sm_html)
 
-    # Filter
-    crawl_urls = [
+    # Filter sitemap pages
+    filtered_sitemap = [
         p for p in sitemap_pages
         if p["url"] not in (url, url + "/")
         and not SKIP_EXTENSIONS.search(p["url"])
         and p["url"].startswith("http")
     ]
 
+    # 2b. Homepage link fallback — if sitemap yielded nothing useful, extract links from the rendered homepage
+    homepage_links = []
+    if not filtered_sitemap:
+        homepage_links = extract_links_from_html(html, base)
+
+    # Use sitemap as primary, homepage links as fallback
+    crawl_urls = filtered_sitemap if filtered_sitemap else homepage_links
+
+    # Page-type sampling: pick one URL per page type
     if page_type_mode and crawl_urls:
         samples = select_page_type_samples(crawl_urls)
         sample_set = {s["url"] for s in samples}
@@ -1019,10 +1292,15 @@ def audit(url, max_pages=10, timeout=15, max_bytes=524288, verify_ssl=True, page
     if max_pages > 0:
         crawl_urls = crawl_urls[:max_pages]
 
+    # Build page discovery summary
+    page_discovery = build_page_discovery(
+        filtered_sitemap, homepage_links, crawl_urls, page_type_mode
+    )
+
     # 3. Additional pages
     for page_info in crawl_urls:
         pu = page_info["url"]
-        st, html, err = _fetch(pu, _fetch_timeout, _fetch_max, verify_ssl if not use_render else True)
+        st, html, err, contrast_raw = _fetch(pu, _fetch_timeout, _fetch_max, verify_ssl if not use_render else True)
         if err and st == 0:
             result["additional_pages"].append({"url": pu, "status": 0, "error": err})
             continue
@@ -1030,6 +1308,16 @@ def audit(url, max_pages=10, timeout=15, max_bytes=524288, verify_ssl=True, page
             result["additional_pages"].append({"url": pu, "status": st, "is_html": False})
             continue
         checks, parser, js_heavy = run_checks(html, pu)
+        
+        # Contrast check from computed styles (Playwright only)
+        if use_render and contrast_raw:
+            contrast_checks = check_contrast_from_computed(contrast_raw, pu)
+            checks.extend(contrast_checks)
+            # Track cumulative contrast stats
+            n_checked = len(contrast_raw.get("elements", [])) if isinstance(contrast_raw, dict) else 0
+            result["contrast_elements_checked"] = result.get("contrast_elements_checked", 0) + n_checked
+            if isinstance(contrast_raw, dict) and contrast_raw.get("capped", False) and n_checked >= 480:
+                result["contrast_capped"] = True
         pr = {
             "url": pu, "status": st,
             "title": parser.title, "lang": parser.lang,
@@ -1065,8 +1353,15 @@ def audit(url, max_pages=10, timeout=15, max_bytes=524288, verify_ssl=True, page
     result["score"] = score
     result["grade"] = get_grade(score)
 
-    # 6. Findings (all checks as dicts)
-    result["findings"] = [c.to_dict() for c in all_checks]
+    # 6. Findings (deduplicated)
+    findings_dicts = [c.to_dict() for c in all_checks]
+    findings_deduped = deduplicate_findings(findings_dicts)
+    result["findings"] = findings_deduped
+    result["total_findings_raw"] = len(all_checks)
+    result["total_findings_unique"] = len(findings_deduped)
+
+    # 7. Page discovery summary
+    result["page_discovery"] = page_discovery
 
     return result
 
@@ -1087,7 +1382,7 @@ def main():
     def validate_url(u):
         u = u.strip()
         if not re.match(r"^https?://", u, re.I): return None
-        if any(c in u for c in ';|&$`(){}<>\\n'): return None
+        if any(c in u for c in ';|&$`(){}<>\\'): return None
         return u
 
     if not args.url:

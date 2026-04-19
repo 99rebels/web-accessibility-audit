@@ -29,16 +29,16 @@ allowed-tools:
 ## Quick Start
 
 ```bash
-# Default mode (fast, no extra dependencies)
-python3 scripts/a11y-audit.py "https://example.com"
-
-# JS rendering mode (recommended for thorough audits)
+# Full audit with JS rendering (recommended for all sites)
 python3 scripts/a11y-audit.py "https://example.com" --render
+
+# Basic mode (no JS rendering — misses issues on modern sites)
+python3 scripts/a11y-audit.py "https://example.com"
 ```
 
-### Installing Playwright (for JS rendering)
+### Installing Playwright (required for full audits)
 
-The `--render` flag enables full JavaScript rendering via Playwright. This is **strongly recommended** for modern websites — most sites today rely on JS to render content, and without it the audit may miss significant issues or produce false positives.
+The `--render` flag enables full JavaScript rendering via Playwright. **Most modern websites rely on JavaScript** — without `--render`, the audit misses significant issues and produces false positives. Always use it.
 
 **Install in two steps:**
 
@@ -49,7 +49,7 @@ playwright install chromium
 
 This downloads the Chromium browser (~130MB, one-time). If Chrome is already installed on the system, Playwright will use it automatically without the download.
 
-**If Playwright is not installed and `--render` is used:** The script will fall back to plain HTTP mode and print a warning. The audit still runs, but results may be incomplete for JS-heavy sites.
+**If Playwright is not installed:** The script falls back to plain HTTP mode with a warning. The audit still runs, but results will be incomplete for JavaScript-heavy sites.
 
 **What Playwright does:** Opens a real browser, loads the page, waits for all JavaScript to execute, then extracts the fully rendered HTML for analysis. The LLM never sees JavaScript code — only the rendered HTML results.
 
@@ -98,15 +98,18 @@ Internal technical notes for the freelancer: what was checked, what couldn't be 
 
 ### Step 1: Crawl
 
-**Always use `--render` for thorough audits.** JS rendering catches significantly more issues and reduces false positives on modern websites.
+⚠️ **ALWAYS run with `--render`.** Do not omit `--render` unless the user explicitly asks for a basic/fast audit. Modern websites rely on JavaScript — without `--render`, the audit will miss headings, links, images, and ARIA elements that only appear after JS executes. This produces false positives, inaccurate scores, and a report the freelancer can't trust.
 
-If the user hasn't installed Playwright:
-1. Run the audit with `--render` anyway
-2. If it falls back to plain HTTP, **tell the user clearly:**
-   - "Playwright is required for JS rendering but isn't installed. The audit ran in basic mode, which may miss issues on JavaScript-heavy sites."
-   - Provide the install commands: `pip install playwright && playwright install chromium`
+**Plain HTTP mode (`--render` omitted) should only be used when:**
+- The user explicitly requests a quick/basic scan
+- Playwright is not installed AND the user declines to install it
+
+**If Playwright is not installed:**
+1. Run the audit with `--render` anyway (it will fall back to plain HTTP and warn)
+2. **Tell the user clearly:**
+   - "Playwright isn't installed, so the audit ran in basic mode. This misses issues on JavaScript-heavy sites. Install it with: `pip install playwright && playwright install chromium`"
    - Offer to re-run with `--render` after installation
-3. **Do not proceed with the report as if nothing happened.** The user should know the limitation and have the choice to install.
+3. **Do not proceed with the report as if nothing happened.** The user must know the limitation.
 
 Run the script. Review the JSON output.
 
@@ -118,7 +121,15 @@ The script outputs:
 - `render_mode` — "playwright" or "plain_http"
 - `render_warning` — present if `--render` was requested but Playwright wasn't available
 - `js_heavy` — true if the page appears to be JavaScript-heavy (in aggregate)
-- `findings` — array of individual findings with WCAG criterion, severity, element, detail, fix hint
+- `findings` — array of individual findings with WCAG criterion, severity, element, detail, fix hint. Each finding has a `count` field — if >1, the same finding appeared on multiple pages. Report as one finding with "×N" notation.
+- `total_findings_raw` — total findings before deduplication
+- `total_findings_unique` — unique findings after deduplication
+- `page_discovery` — summary of what was found:
+  - `total_discovered` — total unique pages found across all sources
+  - `source` — where pages came from: "sitemap", "homepage_links", or "sitemap+homepage_links"
+  - `by_type` — page count per type (homepage, product, category, content, other)
+  - `audited_count` — number of pages actually audited
+  - `audited_urls` — list of audited URLs
 - `aggregate.by_severity` — counts per severity level
 - `aggregate.by_criterion` — counts per WCAG criterion
 - `aggregate.criteria_checked` — which criteria had findings
@@ -158,7 +169,7 @@ Specific rules:
 - **Legal statistics:** Use ONLY the numbers provided in the Legal Context reference section below. Do not look up, estimate, or update these numbers.
 - **WCAG criteria:** Only list criteria that the script actually checked (see WCAG Criteria Checked section). Do not add criteria the script doesn't cover.
 - **Effort estimates:** These are the LLM's professional judgment and are acceptable to generate, but keep them realistic and proportional.
-- **Consolidate duplicates:** If the script produces multiple identical findings (same criterion, same element), report them as one finding with a count (e.g., "×2"), not as separate entries.
+- **Consolidate duplicates:** If a finding has `count > 1`, report it as one finding with "×N" notation (e.g., "×3"). The `count` field comes from the script — do not count manually.
 - **False positives:** If you suspect a finding is a false positive, still include it in the client report but note the caveat in the detail. Explain your reasoning in the freelancer notes.
 - **When unsure:** Include the finding as reported by the script. Flag uncertainty in the freelancer notes. Never silently drop a finding.
 
@@ -444,8 +455,7 @@ The script checks the following WCAG 2.1 Level A and AA criteria:
 | 1.1.1 Non-text Content | A | Missing alt text on images, empty alt on informative images, SVG accessibility |
 | 1.3.1 Info and Relationships | A | Heading hierarchy (h1-h6), table headers, form label associations, list markup |
 | 1.4.1 Use of Color | A | Color used as sole indicator |
-| 1.4.3 Contrast (Minimum) | AA | Text contrast ratio (calculated from inline styles) |
-| 1.4.11 Non-text Contrast | AA | UI component contrast |
+| 1.4.3 Contrast (Minimum) | AA | Text contrast ratio — computed styles via Playwright (`getComputedStyle()`), background walk-up for transparent backgrounds |
 
 ### Operable
 | Criterion | Level | What's Checked |
